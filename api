@@ -1,0 +1,140 @@
+
+import { GoogleGenAI, Type } from "https://esm.sh/@google/genai@^1.10.0";
+import { Equipment, AnalysisResult, Status } from '../types';
+
+// This function will be deployed as a Vercel Serverless Function.
+// It uses the standard Request and Response objects available in modern edge runtimes.
+export default async (req: Request): Promise<Response> => {
+    // Standard CORS headers
+    const corsHeaders = {
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Headers': 'Content-Type',
+        'Access-Control-Allow-Methods': 'POST, OPTIONS',
+    };
+
+    // Handle CORS preflight requests for browser compatibility
+    if (req.method === 'OPTIONS') {
+        return new Response(null, { status: 204, headers: corsHeaders });
+    }
+
+    // Ensure the request method is POST
+    if (req.method !== 'POST') {
+        return new Response(JSON.stringify({ error: 'Method Not Allowed' }), {
+            status: 405,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+
+    try {
+        // API_KEY is securely accessed from environment variables set in the Vercel dashboard
+        if (!process.env.API_KEY) {
+            console.error("API_KEY environment variable not set on the server.");
+            return new Response(JSON.stringify({ error: 'Server configuration error.' }), {
+                status: 500,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const { equipment, historicalData } = await req.json() as { equipment: Equipment, historicalData: string };
+
+        if (!equipment || !historicalData) {
+            return new Response(JSON.stringify({ error: 'Missing equipment or historicalData in request body.' }), {
+                status: 400,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+        
+        const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+
+        const responseSchema = {
+            type: Type.OBJECT,
+            properties: {
+                status: { 
+                type: Type.STRING,
+                enum: [Status.HEALTHY, Status.WARNING, Status.CRITICAL],
+                description: "The overall predicted status of the equipment.",
+                },
+                failure_probability: { 
+                type: Type.NUMBER,
+                description: "A value between 0.0 and 1.0 representing the probability of failure in the next 30 days." 
+                },
+                remaining_useful_life_days: {
+                type: Type.INTEGER,
+                description: "The estimated number of days until the next required major maintenance or potential failure."
+                },
+                analysis_summary: {
+                type: Type.STRING,
+                description: "A concise, executive-level summary of the equipment's condition and the key indicators driving the assessment."
+                },
+                recommendations: {
+                type: Type.ARRAY,
+                items: {
+                    type: Type.STRING
+                },
+                description: "A list of 2-4 specific, actionable maintenance recommendations, formatted as imperative commands."
+                }
+            },
+            required: ['status', 'failure_probability', 'remaining_useful_life_days', 'analysis_summary', 'recommendations']
+        };
+        
+        const { name, type, location, sensorData } = equipment;
+  
+        const prompt = `
+            **System Role:** You are an expert AI for predictive maintenance in the Oil and Gas industry, specifically for ONGC. Your analysis must be precise, data-driven, and provide actionable recommendations.
+
+            **Task:** Analyze the following equipment based on its current sensor readings and provide a predictive maintenance assessment.
+
+            ${historicalData}
+
+            **Current Equipment for Analysis:**
+            
+            **Equipment Details:**
+            - Name: ${name}
+            - Type: ${type}
+            - Location: ${location}
+
+            **Current Sensor Readings:**
+            - Temperature: ${sensorData.temperature}°C
+            - RPM: ${sensorData.rpm}
+            - Torque: ${sensorData.torque} Nm
+            - Vibrations: ${sensorData.vibrations} mm/s
+            - Power Output: ${sensorData.power_output} MW
+            - Fuel Flow Rate: ${sensorData.fuel_flow_rate} kg/s
+            - Air Pressure: ${sensorData.air_pressure} kPa
+            - Exhaust Gas Temperature: ${sensorData.exhaust_gas_temp}°C
+            - Oil Temperature: ${sensorData.oil_temp}°C
+
+            **Instructions:**
+            1.  **Analyze Anomalies:** Compare the current sensor readings with the provided healthy and faulty historical data samples. Identify key anomalies or trends that suggest potential degradation or impending failure.
+            2.  **Determine Status:** Based on the severity of anomalies, determine the equipment's overall status (Healthy, Warning, Critical).
+            3.  **Estimate Risk:** Quantify the risk by estimating the failure probability within the next 30 days (0.0 to 1.0) and the Remaining Useful Life (RUL) in days.
+            4.  **Write Summary:** Provide a concise, executive-level summary of your analysis, highlighting the most critical sensor readings influencing your conclusion.
+            5.  **Generate Recommendations:** Create 2-4 specific, actionable maintenance recommendations. Phrase them as clear, imperative commands (e.g., "Inspect lubrication system," "Schedule vibration analysis").
+        `;
+
+        const response = await ai.models.generateContent({
+            model: "gemini-2.5-flash",
+            contents: prompt,
+            config: {
+                responseMimeType: "application/json",
+                responseSchema: responseSchema,
+                temperature: 0.5,
+            },
+        });
+        
+        const parsedResult = JSON.parse(response.text.trim());
+
+        return new Response(JSON.stringify(parsedResult), {
+            status: 200,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+
+    } catch (error) {
+        console.error("Error in /api/analyze:", error);
+        const errorMessage = error instanceof Error ? error.message : "An unknown internal error occurred.";
+        return new Response(JSON.stringify({ error: `AI analysis failed: ${errorMessage}` }), {
+            status: 500,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+};
